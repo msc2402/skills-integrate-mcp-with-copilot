@@ -1,81 +1,50 @@
 """
 High School Management System API
 
-A super simple FastAPI application that allows students to view and sign up
+A FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
+Now with persistent database storage and improved error handling!
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 import os
+import logging
 from pathlib import Path
+from .database import get_db, init_database, seed_initial_data, create_backup
+from .models import Activity, User, activity_participants
 
-app = FastAPI(title="Mergington High School API",
-              description="API for viewing and signing up for extracurricular activities")
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Mergington High School API",
+    description="API for viewing and signing up for extracurricular activities",
+    version="2.0.0"
+)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
 
-# In-memory activity database
-activities = {
-    "Chess Club": {
-        "description": "Learn strategies and compete in chess tournaments",
-        "schedule": "Fridays, 3:30 PM - 5:00 PM",
-        "max_participants": 12,
-        "participants": ["michael@mergington.edu", "daniel@mergington.edu"]
-    },
-    "Programming Class": {
-        "description": "Learn programming fundamentals and build software projects",
-        "schedule": "Tuesdays and Thursdays, 3:30 PM - 4:30 PM",
-        "max_participants": 20,
-        "participants": ["emma@mergington.edu", "sophia@mergington.edu"]
-    },
-    "Gym Class": {
-        "description": "Physical education and sports activities",
-        "schedule": "Mondays, Wednesdays, Fridays, 2:00 PM - 3:00 PM",
-        "max_participants": 30,
-        "participants": ["john@mergington.edu", "olivia@mergington.edu"]
-    },
-    "Soccer Team": {
-        "description": "Join the school soccer team and compete in matches",
-        "schedule": "Tuesdays and Thursdays, 4:00 PM - 5:30 PM",
-        "max_participants": 22,
-        "participants": ["liam@mergington.edu", "noah@mergington.edu"]
-    },
-    "Basketball Team": {
-        "description": "Practice and play basketball with the school team",
-        "schedule": "Wednesdays and Fridays, 3:30 PM - 5:00 PM",
-        "max_participants": 15,
-        "participants": ["ava@mergington.edu", "mia@mergington.edu"]
-    },
-    "Art Club": {
-        "description": "Explore your creativity through painting and drawing",
-        "schedule": "Thursdays, 3:30 PM - 5:00 PM",
-        "max_participants": 15,
-        "participants": ["amelia@mergington.edu", "harper@mergington.edu"]
-    },
-    "Drama Club": {
-        "description": "Act, direct, and produce plays and performances",
-        "schedule": "Mondays and Wednesdays, 4:00 PM - 5:30 PM",
-        "max_participants": 20,
-        "participants": ["ella@mergington.edu", "scarlett@mergington.edu"]
-    },
-    "Math Club": {
-        "description": "Solve challenging problems and participate in math competitions",
-        "schedule": "Tuesdays, 3:30 PM - 4:30 PM",
-        "max_participants": 10,
-        "participants": ["james@mergington.edu", "benjamin@mergington.edu"]
-    },
-    "Debate Team": {
-        "description": "Develop public speaking and argumentation skills",
-        "schedule": "Fridays, 4:00 PM - 5:30 PM",
-        "max_participants": 12,
-        "participants": ["charlotte@mergington.edu", "henry@mergington.edu"]
-    }
-}
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on startup"""
+    try:
+        logger.info("Starting up Mergington High School API...")
+        await init_database()
+        await seed_initial_data()
+        logger.info("Database initialization completed successfully")
+    except Exception as e:
+        logger.error(f"Error during startup: {e}")
+        # Continue startup even if seeding fails
 
 
 @app.get("/")
@@ -84,49 +53,174 @@ def root():
 
 
 @app.get("/activities")
-def get_activities():
-    return activities
+async def get_activities(db: AsyncSession = Depends(get_db)):
+    """Get all activities with their participants"""
+    try:
+        from sqlalchemy.orm import selectinload
+        result = await db.execute(
+            select(Activity).options(selectinload(Activity.participants))
+        )
+        activities = result.scalars().all()
+        
+        # Convert to the format expected by the frontend
+        activities_dict = {}
+        for activity in activities:
+            activities_dict[activity.name] = {
+                "description": activity.description,
+                "schedule": activity.schedule,
+                "max_participants": activity.max_participants,
+                "participants": [user.email for user in activity.participants],
+                "available_spots": activity.available_spots,
+                "is_full": activity.is_full
+            }
+        
+        return activities_dict
+    except SQLAlchemyError as e:
+        logger.error(f"Database error in get_activities: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error retrieving activities from database"
+        )
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+async def signup_for_activity(activity_name: str, email: str, db: AsyncSession = Depends(get_db)):
     """Sign up a student for an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
-    activity = activities[activity_name]
-
-    # Validate student is not already signed up
-    if email in activity["participants"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Student is already signed up"
+    try:
+        from sqlalchemy.orm import selectinload
+        # Get the activity with participants loaded
+        result = await db.execute(
+            select(Activity)
+            .options(selectinload(Activity.participants))
+            .where(Activity.name == activity_name)
         )
-
-    # Add student
-    activity["participants"].append(email)
-    return {"message": f"Signed up {email} for {activity_name}"}
+        activity = result.scalar_one_or_none()
+        
+        if not activity:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        
+        # Check if activity is full before proceeding
+        if activity.is_full:
+            raise HTTPException(
+                status_code=400,
+                detail="Activity is full"
+            )
+        
+        # Get or create the user
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            user = User(email=email)
+            db.add(user)
+            await db.flush()  # Get the user ID
+        
+        # Check if user is already signed up
+        if user in activity.participants:
+            raise HTTPException(
+                status_code=400,
+                detail="Student is already signed up"
+            )
+        
+        # Add user to activity
+        activity.participants.append(user)
+        await db.commit()
+        
+        logger.info(f"User {email} signed up for {activity_name}")
+        return {"message": f"Signed up {email} for {activity_name}"}
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except IntegrityError as e:
+        await db.rollback()
+        logger.error(f"Integrity error in signup: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Data integrity error - possibly invalid email format"
+        )
+    except SQLAlchemyError as e:
+        await db.rollback()
+        logger.error(f"Database error in signup: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error processing signup request"
+        )
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+async def unregister_from_activity(activity_name: str, email: str, db: AsyncSession = Depends(get_db)):
     """Unregister a student from an activity"""
-    # Validate activity exists
-    if activity_name not in activities:
-        raise HTTPException(status_code=404, detail="Activity not found")
-
-    # Get the specific activity
-    activity = activities[activity_name]
-
-    # Validate student is signed up
-    if email not in activity["participants"]:
+    try:
+        from sqlalchemy.orm import selectinload
+        # Get the activity with participants loaded
+        result = await db.execute(
+            select(Activity)
+            .options(selectinload(Activity.participants))
+            .where(Activity.name == activity_name)
+        )
+        activity = result.scalar_one_or_none()
+        
+        if not activity:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        
+        # Get the user
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+        
+        if not user or user not in activity.participants:
+            raise HTTPException(
+                status_code=400,
+                detail="Student is not signed up for this activity"
+            )
+        
+        # Remove user from activity
+        activity.participants.remove(user)
+        await db.commit()
+        
+        logger.info(f"User {email} unregistered from {activity_name}")
+        return {"message": f"Unregistered {email} from {activity_name}"}
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except SQLAlchemyError as e:
+        await db.rollback()
+        logger.error(f"Database error in unregister: {e}")
         raise HTTPException(
-            status_code=400,
-            detail="Student is not signed up for this activity"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error processing unregister request"
         )
 
-    # Remove student
-    activity["participants"].remove(email)
-    return {"message": f"Unregistered {email} from {activity_name}"}
+
+@app.get("/admin/backup")
+async def create_database_backup():
+    """Create a backup of the database (admin endpoint)"""
+    try:
+        backup_path = await create_backup()
+        if backup_path:
+            return {"message": "Backup created successfully", "backup_path": backup_path}
+        else:
+            return {"message": "Backup not available for this database type"}
+    except Exception as e:
+        logger.error(f"Error creating backup: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error creating database backup"
+        )
+
+
+@app.get("/health")
+async def health_check(db: AsyncSession = Depends(get_db)):
+    """Health check endpoint to verify database connectivity"""
+    try:
+        # Simple query to test database connection
+        result = await db.execute(select(Activity).limit(1))
+        result.scalar_one_or_none()
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed"
+        )
